@@ -95,6 +95,13 @@ THRESHOLDS = {
     'excellence': 95
 }
 
+# Overflow budget for a single displayed-math line, measured on approximate
+# RENDERED width (see IssueDetector._rendered_math_len), not source length.
+# Lower than the old 120-character source limit because stripping markup
+# shrinks every line: keeping 120 here would have let genuinely wide
+# equations through.
+MATH_WIDTH_LIMIT = 100
+
 # ==============================================================================
 # ISSUE DETECTION (Lightweight checks - full agents run separately)
 # ==============================================================================
@@ -187,13 +194,87 @@ class IssueDetector:
             if in_math:
                 # Strip LaTeX comments before measuring
                 code_part = line.split('%')[0] if '%' in line else line
-                if len(code_part.strip()) > 120:
+                if IssueDetector._rendered_math_len(code_part) > MATH_WIDTH_LIMIT:
                     overflows.append(i)
 
         return overflows
 
     @staticmethod
-    def check_broken_citations(content: str, bib_file: Path) -> List[str]:
+    def _rendered_math_len(line: str) -> int:
+        """Approximate the rendered width of a math line, not its source width.
+
+        Measuring raw source over-reports badly: markup such as
+        \\underbrace{...}_{\\text{...}} is several times longer in source than
+        on screen, so heavily annotated but perfectly well-fitting equations
+        were flagged as overflowing. Keep the text that renders, drop the
+        markup that does not.
+        """
+        text = line
+        # Keep the visible content of text-like wrappers.
+        text = re.sub(
+            r'\\(?:text|textrm|textbf|mathrm|mathbf|mathit|mathcal|operatorname)'
+            r'\s*\{([^{}]*)\}',
+            r'\1', text)
+        # Remaining control sequences render as one symbol at most.
+        text = re.sub(r'\\[A-Za-z]+\s*', ' ', text)
+        text = re.sub(r'\\[^A-Za-z]', ' ', text)
+        # Grouping and scripting characters are not drawn.
+        text = re.sub(r'[{}_^&$]', '', text)
+        return len(text.strip())
+
+    @staticmethod
+    def resolve_bib_files(filepath: Path, content: str = '') -> List[Path]:
+        """Find the bibliography file(s) that actually apply to this document.
+
+        The bibliography filename used to be hardcoded to the upstream
+        template's `Bibliography_base.bib`, so any project using a different
+        name reported every citation as missing and scored 0. Prefer what the
+        document itself declares (Quarto `bibliography:`, LaTeX
+        \\bibliography{} / \\addbibresource{}), resolved relative to the file;
+        otherwise fall back to any .bib alongside the file or above it.
+        """
+        declared = re.findall(r'^\s*bibliography:\s*(.+?)\s*$', content, re.MULTILINE)
+        declared += re.findall(r'\\(?:bibliography|addbibresource)\{([^}]+)\}', content)
+
+        found: List[Path] = []
+        for entry in declared:
+            for item in re.split(r'[,\s]+', entry.strip().strip('[]"\'')):
+                if not item:
+                    continue
+                if not item.endswith('.bib'):
+                    item += '.bib'
+                candidate = (filepath.parent / item.strip('"\'')).resolve()
+                if candidate.exists():
+                    found.append(candidate)
+        if found:
+            return list(dict.fromkeys(found))
+
+        for directory in (filepath.parent, filepath.parent.parent,
+                          filepath.parent.parent.parent):
+            if directory.exists():
+                nearby = sorted(directory.glob('*.bib'))
+                if nearby:
+                    return nearby
+        return []
+
+    @staticmethod
+    def collect_bib_keys(bib_files: List[Path]) -> Optional[set]:
+        """Union of citation keys across the given .bib files.
+
+        Returns None when no bibliography could be located, so callers can
+        skip the check instead of reporting every key as broken.
+        """
+        existing = [b for b in bib_files if b.exists()]
+        if not existing:
+            return None
+        keys = set()
+        for bib in existing:
+            keys |= set(re.findall(r'@\w+\{([^,]+),',
+                                   bib.read_text(encoding='utf-8')))
+        return keys
+
+    @staticmethod
+    def check_broken_citations(content: str, bib_files: List[Path]) -> List[str]:
         """Check for LaTeX citation keys not in bibliography.
 
         Matches \\cite{}, \\citep{}, \\citet{}, \\citeauthor{}, \\citeyear{}, etc.
@@ -204,14 +285,11 @@ class IssueDetector:
             keys = match.group(1).split(',')
             cited_keys.update(k.strip() for k in keys)
 
-        if not bib_file.exists():
-            return list(cited_keys)
+        bib_keys = IssueDetector.collect_bib_keys(bib_files)
+        if bib_keys is None:
+            return []
 
-        bib_content = bib_file.read_text(encoding='utf-8')
-        bib_keys = set(re.findall(r'@\w+\{([^,]+),', bib_content))
-
-        broken = cited_keys - bib_keys
-        return list(broken)
+        return list(cited_keys - bib_keys)
 
     @staticmethod
     def check_plotly_widgets(html_file: Path, expected: int = None) -> Tuple[int, bool]:
@@ -253,8 +331,22 @@ class IssueDetector:
         issues = []
         lines = content.split('\n')
 
+        # A quote followed by any backslash used to count as a path, which made
+        # every escape sequence a finding -- message("\n--- Model 0 ---") was
+        # reported as a hardcoded Windows path. Require something that actually
+        # looks like an absolute path: a leading slash before a path character,
+        # a drive letter, or a home-directory expansion.
+        abs_path = re.compile(
+            r'''["'](?:
+                    /(?![/*\s])[\w.~-]      # "/home/...  "/Users/...  (not "// or "/*)
+                  | [A-Za-z]:[/\\]          # "C:\...  "D:/...
+                  | ~/                      # "~/Dropbox/...
+                )''',
+            re.VERBOSE,
+        )
+
         for i, line in enumerate(lines, 1):
-            if re.search(r'["\'][/\\]|["\'][A-Za-z]:[/\\]', line):
+            if abs_path.search(line):
                 if not re.search(r'http:|https:|file://|/tmp/', line):
                     issues.append(i)
 
@@ -342,12 +434,71 @@ class IssueDetector:
 
         return issues
 
+    # Quarto cross-reference prefixes. `@fig-area` is a reference to a figure,
+    # not a bibliography key, so it must never be reported as a broken
+    # citation. The old skip-list held only the bare words ("fig", "tbl", ...)
+    # and so caught nothing real: every crossref in a manuscript was counted
+    # as a missing citation at -15 points each.
+    CROSSREF_PREFIXES = ('fig', 'tbl', 'sec', 'eq', 'lst', 'thm', 'lem', 'cor',
+                         'prp', 'cnj', 'def', 'exm', 'exr', 'alg', 'vid')
+
     @staticmethod
-    def check_quarto_citations(content: str, bib_file: Path) -> List[str]:
+    def _is_crossref(key: str) -> bool:
+        """True for Quarto cross-references such as @fig-area or @tbl-effects."""
+        if key in IssueDetector.CROSSREF_PREFIXES:
+            return True
+        prefix = key.split('-', 1)[0]
+        return '-' in key and prefix in IssueDetector.CROSSREF_PREFIXES
+
+    @staticmethod
+    def _strip_noncontent(content: str) -> str:
+        """Remove regions whose text is never rendered as prose.
+
+        Citation scanning must not see fenced code, inline code, or HTML
+        comments: a commented-out note reading "swap to [@key] later" was
+        reported as the missing citation key "key", and an `@` inside a code
+        chunk is not a citation either. Replace each region with blank space so
+        line numbering is unaffected for any caller that needs it.
+        """
+        def blank(match: 're.Match') -> str:
+            return re.sub(r'[^\n]', ' ', match.group(0))
+
+        # Fenced blocks are paired line-wise, NOT with a DOTALL regex. A
+        # document with an odd number of fences (35 in one real manuscript)
+        # makes `` ```.*?``` `` mis-pair every fence after the stray one, which
+        # blanked a quarter of the file and silently hid genuine findings.
+        # Pairing explicitly means a trailing unmatched opener is ignored
+        # instead of swallowing everything to the end of the file.
+        lines = content.split('\n')
+        fence_re = re.compile(r'^\s*(?:```+|~~~+)')
+        fence_lines = [i for i, line in enumerate(lines) if fence_re.match(line)]
+        for start, end in zip(fence_lines[0::2], fence_lines[1::2]):
+            for i in range(start, end + 1):
+                lines[i] = ' ' * len(lines[i])
+        content = '\n'.join(lines)
+
+        # These two are safe as regexes: an unclosed `<!--` simply does not
+        # match, and inline code spans never cross a line boundary.
+        content = re.sub(r'<!--.*?-->', blank, content, flags=re.DOTALL)
+        content = re.sub(r'`[^`\n]+`', blank, content)
+        return content
+
+    @staticmethod
+    def _clean_cite_key(key: str) -> str:
+        """Strip trailing punctuation that the key character class swallows.
+
+        `@jennings.etal_2011b:` in running prose otherwise becomes the key
+        "jennings.etal_2011b:" and never matches the bibliography.
+        """
+        return key.rstrip(':.,;')
+
+    @staticmethod
+    def check_quarto_citations(content: str, bib_files: List[Path]) -> List[str]:
         """Check Quarto-style citation keys against bibliography.
 
         Supports patterns: @key, [@key], [@key1; @key2]
         """
+        content = IssueDetector._strip_noncontent(content)
         cited_keys = set()
 
         # Pattern 1: [@key] or [@key1; @key2; ...]
@@ -356,7 +507,9 @@ class IssueDetector:
             inner = match.group(1)
             # Extract individual @key references from within brackets
             for key_match in re.finditer(r'@([\w:.#$%&\-+?<>~/]+)', inner):
-                cited_keys.add(key_match.group(1))
+                key = IssueDetector._clean_cite_key(key_match.group(1))
+                if key and not IssueDetector._is_crossref(key):
+                    cited_keys.add(key)
 
         # Pattern 2: standalone @key (not inside brackets, not email addresses)
         # Match @key that is preceded by start-of-line or whitespace or punctuation
@@ -364,22 +517,22 @@ class IssueDetector:
         standalone_pattern = r'(?<![.\w])@([\w:.#$%&\-+?<>~/]+)'
         for match in re.finditer(standalone_pattern, content):
             key = match.group(1)
-            # Skip if it looks like a Quarto directive or special syntax
-            if key.startswith('{') or key in ('fig', 'tbl', 'sec', 'eq', 'lst'):
+            # Skip Quarto directives and special syntax
+            if key.startswith('{'):
+                continue
+            key = IssueDetector._clean_cite_key(key)
+            if not key or IssueDetector._is_crossref(key):
                 continue
             cited_keys.add(key)
 
         if not cited_keys:
             return []
 
-        if not bib_file.exists():
-            return list(cited_keys)
+        bib_keys = IssueDetector.collect_bib_keys(bib_files)
+        if bib_keys is None:
+            return []
 
-        bib_content = bib_file.read_text(encoding='utf-8')
-        bib_keys = set(re.findall(r'@\w+\{([^,]+),', bib_content))
-
-        broken = cited_keys - bib_keys
-        return list(broken)
+        return list(cited_keys - bib_keys)
 
 # ==============================================================================
 # QUALITY SCORER
@@ -432,18 +585,18 @@ class QualityScorer:
             self.score -= 20
 
         # Check broken citations (LaTeX-style \cite patterns)
-        bib_file = self.filepath.parent.parent / 'Bibliography_base.bib'
-        broken_citations = IssueDetector.check_broken_citations(content, bib_file)
+        bib_files = IssueDetector.resolve_bib_files(self.filepath, content)
+        broken_citations = IssueDetector.check_broken_citations(content, bib_files)
 
         # Also check Quarto-style @key citations
-        quarto_broken = IssueDetector.check_quarto_citations(content, bib_file)
+        quarto_broken = IssueDetector.check_quarto_citations(content, bib_files)
         # Merge both sets, avoiding duplicates
         all_broken = set(broken_citations) | set(quarto_broken)
         for key in all_broken:
             self.issues['critical'].append({
                 'type': 'broken_citation',
                 'description': f'Citation key not in bibliography: {key}',
-                'details': 'Add to Bibliography_base.bib or fix key',
+                'details': 'Add to the project bibliography or fix the key',
                 'points': 15
             })
             self.score -= 15
@@ -532,16 +685,13 @@ class QualityScorer:
             return self._generate_report()
 
         # Check for undefined/broken citations (\cite, \citep, \citet patterns)
-        bib_file = self.filepath.parent.parent / 'Bibliography_base.bib'
-        if not bib_file.exists():
-            # Also check same directory
-            bib_file = self.filepath.parent / 'Bibliography_base.bib'
-        broken_citations = IssueDetector.check_broken_citations(content, bib_file)
+        bib_files = IssueDetector.resolve_bib_files(self.filepath, content)
+        broken_citations = IssueDetector.check_broken_citations(content, bib_files)
         for key in broken_citations:
             self.issues['critical'].append({
                 'type': 'undefined_citation',
                 'description': f'Citation key not in bibliography: {key}',
-                'details': 'Add to Bibliography_base.bib or fix key',
+                'details': 'Add to the project bibliography or fix the key',
                 'points': 15
             })
             self.score -= 15
