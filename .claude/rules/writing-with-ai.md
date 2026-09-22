@@ -1,9 +1,12 @@
 ---
 paths:
+  # Local adaptation (2026-09-22): upstream also matched "**/*.md", which
+  # loaded this rule on session logs, plans and quality reports -- the
+  # internal documents the rule itself exempts. Scoped to manuscript files.
   - "**/*.tex"
   - "**/*.qmd"
-  - "**/*.md"
   - "**/*.Rmd"
+  - "manuscript/**"
 ---
 
 # Writing with AI — what actually makes prose human-readable
